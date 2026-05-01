@@ -35,10 +35,26 @@ VPT-specific flags:
 - `--vpt_linear_share {shared, per_roi}` (default `shared`) — `shared` reuses the universal `lh_embed`/`rh_embed`; `per_roi` builds a `PerROILinearHead` (one Linear per ROI, sized to that ROI's vertex count, scattered into the hemisphere with zeros elsewhere).
 - `--vpt_num_prompts_per_roi K` (default 1).
 - `--vpt_roi_chunk N` (default 0 = all ROIs at once) — split the ROI dim into chunks of N inside the forward to reduce peak memory.
+- `--vpt_prompt_share {per_roi, shared}` (default `per_roi`) — `per_roi` folds ROI into batch (~N_ROI× compute); `shared` keeps K prompts shared across ROIs with a single backbone forward, requires `--vpt_readout decoder`.
+- `--vpt_decoder_attend_prompts` (flag, default off) — shared+decoder only. By default the decoder cross-attends only over the patch grid (prompts influence the decoder *indirectly* via the frozen backbone's self-attention). With this flag the prompt tokens are also concatenated into the decoder memory, so the queries cross-attend over patches **and** prompts directly. Implemented in `_forward_vpt_shared` by bypassing `Transformer.forward` and driving its encoder/decoder on a flat `[Lp+K, B, D]` sequence (zero pos-embed for prompt positions, no padding).
 
 Smoke run: `python main.py --epochs 1 --subj 1 --encoder_arch vpt --vpt_readout linear --vpt_linear_feature prompt --vpt_linear_share shared --readout_res rois_all --backbone_arch dinov2 --batch_size 2 --vpt_roi_chunk 10`.
 
-Results are written to `{output_path}/nsd_test/{backbone_arch}_{encoder_arch}/subj_{subj}/{readout_res}/enc_{enc_output_layer}/run_{run}/` and include `params.txt`, `val_results.txt`, per-vertex correlation arrays, and per-epoch best test predictions. `visualize_results.ipynb` reads these.
+Results are written to `{output_path}/nsd_test/{arch_tag}/subj_{subj}/{readout_res}/enc_{enc_output_layer}/run_{run}/`. For non-VPT encoders `arch_tag = {backbone_arch}_{encoder_arch}`; for VPT it is `{backbone_arch}_vpt-{vpt_prompt_share}-{vpt_readout}-{vpt_linear_feature}-{vpt_linear_share}-K{K}` plus a trailing `-attP` when `--vpt_decoder_attend_prompts` is set. Each run dir contains `params.txt`, `val_results.txt`, per-vertex correlation arrays, and per-epoch best test predictions. `visualize_results.ipynb` reads these; `visualize_vpt_experiments.ipynb` is the VPT-experiment-specific copy used for the sweeps below.
+
+### VPT experiment scripts (`scripts/vpt/` + `scripts/run_vpt_experiments.sh`)
+
+Subj 1 sweep used to compare VPT variants. Each experiment is its own script under `scripts/vpt/`, sharing config via `scripts/vpt/_common.sh` (sourced):
+
+- `exp1_linear.sh` — baseline linear (`dinov2_q_linear`)
+- `exp2_transformer.sh` — baseline transformer (`dinov2_q_transformer`)
+- `exp3_shared_vpt.sh` — shared VPT + decoder, patches-only memory, K ∈ {1, 5, 10, 20, 40}
+- `exp4_per_roi_vpt.sh` — per-ROI VPT + linear, K=1 (~50× backbone compute)
+- `exp5_shared_vpt_attend_prompts.sh` — shared VPT + decoder with `--vpt_decoder_attend_prompts`, K ∈ {1, 5, 10, 20, 40}
+
+Each script takes one optional positional arg (`GPU_ID`, default 0; exp4 default 1) and reads env-var overrides from `_common.sh` (`SUBJ`, `RUN`, `EPOCHS`, `BATCH_FAST`, `BATCH_VPT`, `ROI_CHUNK`, `LR`, `WANDB_PROJECT`). exp3/exp5 also accept `KS="20 40"` to override the K sweep.
+
+`scripts/run_vpt_experiments.sh` is a thin orchestrator that delegates to those files. `[all]` (default) runs exp4 in the background on GPU 1 and exp1/2/3/5 serially on GPU 0; `[expN]` runs a single one. All experiments use `enc_output_layer=1`, `readout_res=rois_all`, `backbone=dinov2_q`, `lr=5e-4`, `epochs=15`.
 
 There is no test suite, lint config, or build step.
 
