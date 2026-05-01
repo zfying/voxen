@@ -87,6 +87,10 @@ class brain_encoder(nn.Module):
             self.vpt_num_prompts_per_roi = args.vpt_num_prompts_per_roi
             self.vpt_roi_chunk = args.vpt_roi_chunk if args.vpt_roi_chunk > 0 else self.num_queries
             self.vpt_prompt_share = getattr(args, 'vpt_prompt_share', 'per_roi')
+            self.vpt_decoder_attend_prompts = getattr(args, 'vpt_decoder_attend_prompts', False)
+            if self.vpt_decoder_attend_prompts:
+                assert self.vpt_prompt_share == 'shared' and args.vpt_readout == 'decoder', \
+                    '--vpt_decoder_attend_prompts only applies to shared-prompt + decoder readout'
 
             D = self.backbone_model.num_channels
             if self.vpt_prompt_share == 'per_roi':
@@ -440,7 +444,35 @@ class brain_encoder(nn.Module):
         mem_mask = out_dino['mask']          # [B, h, w]
         pos_embed = self.pos_embed_module(NestedTensor(memory, mem_mask)).to(memory.dtype)
 
-        hs = self.transformer(memory, mem_mask, self.query_embed.weight, pos_embed, self.return_interm)
+        if self.vpt_decoder_attend_prompts:
+            # Concatenate prompt tokens into the decoder memory so cross-attn
+            # sees patches AND prompts. We bypass self.transformer's 4D-input
+            # path and drive its encoder/decoder directly on a flat sequence.
+            patches_seq = memory.flatten(2).permute(2, 0, 1)               # [Lp, B, D]
+            patches_pos = pos_embed.flatten(2).permute(2, 0, 1)            # [Lp, B, D]
+            patches_pad = mem_mask.flatten(1)                              # [B, Lp]
+
+            prompt_seq = out_dino['prompt'].permute(1, 0, 2).to(memory.dtype)  # [K, B, D]
+            prompt_pos = torch.zeros_like(prompt_seq)                      # no spatial pos for prompts
+            prompt_pad = torch.zeros(B, K, dtype=patches_pad.dtype,
+                                     device=patches_pad.device)            # never pad prompts
+
+            mem_seq = torch.cat([patches_seq, prompt_seq], dim=0)          # [Lp+K, B, D]
+            mem_pos = torch.cat([patches_pos, prompt_pos], dim=0)
+            mem_pad = torch.cat([patches_pad, prompt_pad], dim=1)
+
+            tr = self.transformer
+            query_embed = self.query_embed.weight.unsqueeze(1).repeat(1, B, 1)
+            tgt = torch.zeros_like(query_embed)
+            if tr.num_encoder_layers > 0:
+                memory_layers, _ = tr.encoder(mem_seq, src_key_padding_mask=mem_pad, pos=mem_pos)
+                enc_out = memory_layers[tr.enc_output_layer]
+            else:
+                enc_out = mem_seq
+            hs = tr.decoder(tgt, enc_out, memory_key_padding_mask=mem_pad,
+                            pos=mem_pos, query_pos=query_embed).transpose(1, 2)
+        else:
+            hs = self.transformer(memory, mem_mask, self.query_embed.weight, pos_embed, self.return_interm)
         output_tokens = hs[-1]               # [B, N_ROI, D]
 
         lh_tokens = output_tokens[:, :N_ROI // 2, :]

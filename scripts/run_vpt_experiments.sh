@@ -4,14 +4,15 @@
 #   exp1  baseline_linear      : --encoder_arch linear (no soft prompts, ridge linear readout)
 #   exp2  baseline_transformer : --encoder_arch transformer (replicates README example)
 #   exp3  shared VPT + decoder : K shared soft tokens, single backbone forward + cross-attn
-#                                 decoder (sweep K = 1, 5, 10)
+#                                 decoder (sweep K = 1, 5, 10, 20, 40)
 #   exp4  per-ROI VPT + linear : 1 prompt per ROI, shared linear readout (~50x compute)
+#   exp5  shared VPT + decoder, decoder attends to patches+prompts (sweep K = 1, 5, 10, 20, 40)
 #
 # All experiments share: subj=1, enc_output_layer=1, readout_res=rois_all,
 # backbone=dinov2_q (the README default), run=1, lr=5e-4.
 #
 # GPU layout:
-#   GPU 0 -> exp1, exp2, exp3 (K=1,5,10)  serial; each is cheap (~1x baseline cost)
+#   GPU 0 -> exp1, exp2, exp3, exp5      serial; each is cheap (~1x baseline cost)
 #   GPU 1 -> exp4                          (~50x baseline cost, runs alone)
 #
 # Usage:
@@ -71,12 +72,27 @@ run_exp2_transformer() {
 
 run_exp3_shared_vpt() {
     local gpu="${1:-0}"
-    for K in 1 5 10; do
+    for K in 1 5 10 20 40; do
         CUDA_VISIBLE_DEVICES="$gpu" python main.py \
             "${COMMON[@]}" \
             --encoder_arch vpt \
             --vpt_prompt_share shared \
             --vpt_readout decoder \
+            --vpt_num_prompts_per_roi "$K" \
+            --epochs "$EPOCHS" \
+            --batch_size "$BATCH_FAST"
+    done
+}
+
+run_exp5_shared_vpt_attend_prompts() {
+    local gpu="${1:-0}"
+    for K in 1 5 10 20 40; do
+        CUDA_VISIBLE_DEVICES="$gpu" python main.py \
+            "${COMMON[@]}" \
+            --encoder_arch vpt \
+            --vpt_prompt_share shared \
+            --vpt_readout decoder \
+            --vpt_decoder_attend_prompts \
             --vpt_num_prompts_per_roi "$K" \
             --epochs "$EPOCHS" \
             --batch_size "$BATCH_FAST"
@@ -102,6 +118,7 @@ case "${1:-all}" in
     exp2) run_exp2_transformer 0 ;;
     exp3) run_exp3_shared_vpt 0 ;;
     exp4) run_exp4_per_roi_vpt 1 ;;
+    exp5) run_exp5_shared_vpt_attend_prompts 0 ;;
     all)
         # Long job on GPU 1 in the background; cheap pipeline on GPU 0 in foreground.
         mkdir -p logs
@@ -109,12 +126,13 @@ case "${1:-all}" in
         EXP4_PID=$!
         echo "exp4 (per-ROI VPT) launched on GPU 1, pid=$EXP4_PID, log=logs/exp4_per_roi_vpt.log"
 
-        run_exp1_linear      0 2>&1 | tee logs/exp1_linear.log
-        run_exp2_transformer 0 2>&1 | tee logs/exp2_transformer.log
-        run_exp3_shared_vpt  0 2>&1 | tee logs/exp3_shared_vpt.log
+        run_exp1_linear                       0 2>&1 | tee logs/exp1_linear.log
+        run_exp2_transformer                  0 2>&1 | tee logs/exp2_transformer.log
+        run_exp3_shared_vpt                   0 2>&1 | tee logs/exp3_shared_vpt.log
+        run_exp5_shared_vpt_attend_prompts    0 2>&1 | tee logs/exp5_shared_vpt_attend_prompts.log
 
         wait "$EXP4_PID"
         echo "all experiments finished."
         ;;
-    *) echo "usage: $0 [all|exp1|exp2|exp3|exp4]" ; exit 2 ;;
+    *) echo "usage: $0 [all|exp1|exp2|exp3|exp4|exp5]" ; exit 2 ;;
 esac
