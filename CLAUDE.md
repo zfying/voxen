@@ -32,13 +32,27 @@ VPT-Shallow variant that prepends per-ROI learnable prompt tokens to a frozen DI
 VPT-specific flags:
 - `--vpt_readout {decoder, linear}` (default `linear`) — decoder uses the existing DETR-style cross-attn with a single shared query; linear is a direct projection.
 - `--vpt_linear_feature {prompt, cls, pooled_patches, prompt_cls_concat}` (default `prompt`) — feature fed to linear readout. With K>1 prompts per ROI, `prompt` is mean-pooled.
-- `--vpt_linear_share {shared, per_roi}` (default `shared`) — `shared` reuses the universal `lh_embed`/`rh_embed`; `per_roi` builds a `PerROILinearHead` (one Linear per ROI, sized to that ROI's vertex count, scattered into the hemisphere with zeros elsewhere).
+- `--vpt_linear_share {shared, per_roi, per_voxel}` (default `shared`) — `shared` reuses the universal `lh_embed`/`rh_embed`; `per_roi` builds a `PerROILinearHead` (one Linear per ROI, sized to that ROI's vertex count, scattered into the hemisphere with zeros elsewhere); `per_voxel` builds a `PerVoxelLinearHead` (one D→1 Linear per voxel, applies only with `--vpt_prompt_share per_voxel`).
 - `--vpt_num_prompts_per_roi K` (default 1).
-- `--vpt_roi_chunk N` (default 0 = all ROIs at once) — split the ROI dim into chunks of N inside the forward to reduce peak memory.
-- `--vpt_prompt_share {per_roi, shared}` (default `per_roi`) — `per_roi` folds ROI into batch (~N_ROI× compute); `shared` keeps K prompts shared across ROIs with a single backbone forward, requires `--vpt_readout decoder`.
+- `--vpt_roi_chunk N` (default 0 = all ROIs at once) — split the ROI/voxel dim into chunks of N inside the forward to reduce peak memory. Required (>0) for `--vpt_prompt_share per_voxel`.
+- `--vpt_prompt_share {per_roi, shared, per_voxel}` (default `per_roi`) — `per_roi` folds ROI into batch (~N_ROI× compute); `shared` keeps K prompts shared across ROIs with a single backbone forward, requires `--vpt_readout decoder`; `per_voxel` folds voxel into batch (~N_voxel× compute, ~thousands of forwards/image), requires `--readout_res voxels` and `--vpt_readout linear`.
 - `--vpt_decoder_attend_prompts` (flag, default off) — shared+decoder only. By default the decoder cross-attends only over the patch grid (prompts influence the decoder *indirectly* via the frozen backbone's self-attention). With this flag the prompt tokens are also concatenated into the decoder memory, so the queries cross-attend over patches **and** prompts directly. Implemented in `_forward_vpt_shared` by bypassing `Transformer.forward` and driving its encoder/decoder on a flat `[Lp+K, B, D]` sequence (zero pos-embed for prompt positions, no padding).
 
 Smoke run: `python main.py --epochs 1 --subj 1 --encoder_arch vpt --vpt_readout linear --vpt_linear_feature prompt --vpt_linear_share shared --readout_res rois_all --backbone_arch dinov2 --batch_size 2 --vpt_roi_chunk 10`.
+
+#### Per-voxel VPT (`--vpt_prompt_share per_voxel`)
+
+Each voxel owns its own K-token prompt bundle, injected into the frozen DINOv2 backbone. Backbone runs once per voxel per image (effective batch `B·N_voxel` with `N_voxel = lh_vs + rh_vs ≈ 30k+30k` per subject), folded into the batch dim and chunked by `--vpt_roi_chunk`. This is **~1000× the per-ROI compute cost**; intended as an experimental ceiling, not a routine training mode. Use small `--batch_size` and small `--vpt_roi_chunk`.
+
+Constraints (asserted in `main.py`): requires `--readout_res voxels`, `--vpt_readout linear`, `--vpt_linear_share {shared, per_voxel}`, `--vpt_roi_chunk > 0`, and a DINOv2 backbone.
+
+Readout heads:
+- `--vpt_linear_share shared`: a single `nn.Linear(feat_dim, 1)` shared across all voxels. Voxel identity is carried entirely by the prompt. Tiny readout (~`feat_dim+1` params).
+- `--vpt_linear_share per_voxel`: `PerVoxelLinearHead` — one `D→1` linear per voxel, stored as a fused `[N_voxel, D]` weight + `[N_voxel]` bias. Roughly `60k * 768 ≈ 46M` params for D=768, K=1.
+
+The output is `{lh_f_pred: [B, lh_vs], rh_f_pred: [B, rh_vs]}` (LH-first / RH-second voxel ordering, matching `roi_masks('voxels', ...)`); `SetCriterion`'s `readout_res=='voxels'` branch already takes MSE directly on this shape, so no loss-side changes were needed.
+
+Smoke run: `python main.py --epochs 1 --subj 1 --encoder_arch vpt --vpt_prompt_share per_voxel --vpt_readout linear --vpt_linear_feature prompt --vpt_linear_share shared --vpt_num_prompts_per_roi 1 --readout_res voxels --backbone_arch dinov2 --batch_size 1 --vpt_roi_chunk 64`.
 
 ### 3-stage VPT (`--vpt_staged`)
 

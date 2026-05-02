@@ -19,6 +19,15 @@ from scipy.stats import pearsonr as corr
 
 from models.brain_encoder import brain_encoder
 from engine import train_one_epoch, evaluate, test
+from staged import (
+    build_arch_tag,
+    format_epoch_log_row,
+    LOG_HEADER,
+    partial_load_state_dict,
+    resolve_baseline_checkpoint,
+    set_stage,
+    vpt_param_groups,
+)
 
 import utils.utils as utils 
 from pathlib import Path
@@ -86,6 +95,30 @@ def get_args_parser():
     parser.add_argument('--vpt_decoder_attend_prompts', action='store_true',
                         help='Shared-VPT only: concatenate prompt tokens into the decoder memory '
                              '(decoder cross-attends over patches+prompts). Default: patches only.')
+
+    # 3-stage VPT training (readout-only -> prompts-only -> joint)
+    parser.add_argument('--vpt_staged', action='store_true',
+                        help='Run VPT in 3 stages: (1) readout only, (2) prompts only, (3) joint. '
+                             'Overrides --epochs with the sum of the three stage budgets.')
+    parser.add_argument('--vpt_stage1_epochs', default=5, type=int)
+    parser.add_argument('--vpt_stage2_epochs', default=5, type=int)
+    parser.add_argument('--vpt_stage3_epochs', default=5, type=int)
+    parser.add_argument('--vpt_stage1_lr', default=None, type=float,
+                        help='LR for stage 1 (readout only). Defaults to --lr.')
+    parser.add_argument('--vpt_stage2_lr', default=None, type=float,
+                        help='LR for stage 2 (prompts only). Defaults to --lr.')
+    parser.add_argument('--vpt_stage3_lr', default=None, type=float,
+                        help='LR for stage 3 (joint). Defaults to --lr.')
+    parser.add_argument('--vpt_stage_lr_total_iters', default=None, type=int,
+                        help='LinearLR total_iters within each stage. Defaults to that '
+                             'stage\'s epoch count (so LR decays linearly across the whole stage).')
+    parser.add_argument('--vpt_stage_lr_end_factor', default=0.0, type=float,
+                        help='LinearLR end_factor (final LR = stage_lr * end_factor). Default 0.0 '
+                             '= decay to zero by the last epoch of the stage.')
+    parser.add_argument('--vpt_load_readout', default='auto', type=str,
+                        help="'auto' (default): load readout from a shape-compatible baseline "
+                             "checkpoint under output_path if one exists, then skip stage 1. "
+                             "'none': always run stage 1. Otherwise: explicit checkpoint path.")
     
     parser.add_argument('--objective', choices=['NSD'],
                         default='classification', help='which model to train')
@@ -253,14 +286,7 @@ def main(rank, world_size, args):
     args.data_dir = os.path.join(args.data_dir, 'subj'+ args.subj)
     
     if args.output_path:
-        if args.encoder_arch == 'vpt':
-            arch_tag = (f'{args.backbone_arch}_vpt-{args.vpt_prompt_share}-{args.vpt_readout}'
-                        f'-{args.vpt_linear_feature}-{args.vpt_linear_share}'
-                        f'-K{args.vpt_num_prompts_per_roi}')
-            if args.vpt_decoder_attend_prompts:
-                arch_tag += '-attP'
-        else:
-            arch_tag = f'{args.backbone_arch}_{args.encoder_arch}'
+        arch_tag = build_arch_tag(args)
         args.save_dir = args.output_path + f'nsd_test/{arch_tag}/subj_{args.subj}/{args.readout_res}/enc_{args.enc_output_layer}/run_{args.run}/'
         if (not os.path.exists(args.save_dir)) and (args.gpu == 0):
             os.makedirs(args.save_dir)
@@ -342,7 +368,7 @@ def main(rank, world_size, args):
     
     
     if args.resume:
-        checkpoint = torch.load(args.resume, map_location='cpu')
+        checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
         pretrained_dict = checkpoint['model']
         model.load_state_dict(pretrained_dict)
         
@@ -362,17 +388,36 @@ def main(rank, world_size, args):
             args.start_epoch = checkpoint['epoch'] + 1
             
     else:
-        
-        param_dicts = [ 
-            { "params" : [ p for n , p in model.named_parameters() if p.requires_grad]}, ]  #n not in frozen_params and 
-    
-        train_params = [ n for n , p in model.named_parameters() if p.requires_grad ]  # n not in frozen_params and
 
-        print('\ntrain_params', train_params)
+        # Stage-1 readout autoload: only meaningful for staged VPT runs.
+        stage1_loaded_from = None
+        if args.encoder_arch == 'vpt' and args.vpt_staged:
+            ckpt_path = resolve_baseline_checkpoint(args)
+            if ckpt_path is not None and os.path.exists(ckpt_path):
+                ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+                src = ckpt['model'] if isinstance(ckpt, dict) and 'model' in ckpt else ckpt
+                report = partial_load_state_dict(model, src)
+                stage1_loaded_from = ckpt_path
+                print(f'\n[stage1] loaded readout from {ckpt_path}')
+                print(f'[stage1]   loaded {len(report["loaded"])} tensors, '
+                      f'skipped {len(report["skipped"])}, '
+                      f'missing_in_src {len(report["missing_in_src"])}')
+            elif ckpt_path is not None:
+                print(f'\n[stage1] requested readout checkpoint {ckpt_path} not found; '
+                      f'will train stage 1 in-run')
 
-        optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
-                                      weight_decay=args.weight_decay)
-        lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop, gamma=0.5)
+        if args.encoder_arch == 'vpt' and args.vpt_staged:
+            args.stage1_loaded_from = stage1_loaded_from
+        else:
+            # Single-stage path: build optimizer over all trainable params, as before.
+            param_dicts = [
+                {"params": [p for n, p in model.named_parameters() if p.requires_grad]},
+            ]
+            train_params = [n for n, p in model.named_parameters() if p.requires_grad]
+            print('\ntrain_params', train_params)
+            optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
+                                          weight_decay=args.weight_decay)
+            lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop, gamma=0.5)
 
         args.start_epoch = 0
 
@@ -406,111 +451,150 @@ def main(rank, world_size, args):
         
         
         with open(os.path.join(args.save_dir, 'val_results.txt'), 'w') as f:
-            f.write(f'validation results: \n') 
+            f.write(LOG_HEADER + '\n')
 
     print("Start training")
     start_time = time.time()
-    
-    for epoch in range(args.start_epoch, args.epochs):
-            
-        train_stats = train_one_epoch(
-            model_ddp, criterion, train_loader, optimizer, args.device, epoch,
-            args.clip_max_norm)
-        lr_scheduler.step()
 
+    def run_epochs(model_ddp, model, criterion, optimizer, lr_scheduler,
+                   train_loader, val_loader, test_loader, args,
+                   start_epoch, end_epoch, stage,
+                   lh_challenge_rois, rh_challenge_rois, lh_challenge_rois_s, rh_challenge_rois_s,
+                   roi_name_maps):
+        for epoch in range(start_epoch, end_epoch):
+            train_stats = train_one_epoch(
+                model_ddp, criterion, train_loader, optimizer, args.device, epoch,
+                args.clip_max_norm)
+            lr_scheduler.step()
+            train_loss = float(train_stats.get('loss_labels', train_stats.get('loss', 0.0)))
 
-        # evaluate
-        lh_fmri_val_pred, rh_fmri_val_pred, lh_fmri_val, rh_fmri_val, val_loss = evaluate(model, criterion, val_loader, args, lh_challenge_rois_s, rh_challenge_rois_s)
+            lh_fmri_val_pred, rh_fmri_val_pred, lh_fmri_val, rh_fmri_val, val_loss = evaluate(
+                model, criterion, val_loader, args, lh_challenge_rois_s, rh_challenge_rois_s)
+            val_loss = float(val_loss.item() if hasattr(val_loss, 'item') else val_loss)
 
-        # Empty correlation array of shape: (LH vertices)
-        lh_correlation = np.zeros(lh_fmri_val_pred.shape[1])
-        # Correlate each predicted LH vertex with the corresponding ground truth vertex
-        for v in tqdm(range(lh_fmri_val_pred.shape[1])):
-            lh_correlation[v] = corr(lh_fmri_val_pred[:,v], lh_fmri_val[:,v])[0]
+            lh_correlation = np.zeros(lh_fmri_val_pred.shape[1])
+            for v in tqdm(range(lh_fmri_val_pred.shape[1])):
+                lh_correlation[v] = corr(lh_fmri_val_pred[:, v], lh_fmri_val[:, v])[0]
+            rh_correlation = np.zeros(rh_fmri_val_pred.shape[1])
+            for v in tqdm(range(rh_fmri_val_pred.shape[1])):
+                rh_correlation[v] = corr(rh_fmri_val_pred[:, v], rh_fmri_val[:, v])[0]
 
-        # Empty correlation array of shape: (RH vertices)
-        rh_correlation = np.zeros(rh_fmri_val_pred.shape[1])
-        # Correlate each predicted RH vertex with the corresponding ground truth vertex
-        for v in tqdm(range(rh_fmri_val_pred.shape[1])):
-            rh_correlation[v] = corr(rh_fmri_val_pred[:,v], rh_fmri_val[:,v])[0]
+            roi_names = []
+            lh_roi_correlation = []
+            rh_roi_correlation = []
+            for r1 in range(len(lh_challenge_rois)):
+                for r2 in roi_name_maps[r1].items():
+                    if r2[0] != 0:
+                        roi_names.append(r2[1])
+                        lh_roi_idx = np.where(lh_challenge_rois[r1] == r2[0])[0]
+                        rh_roi_idx = np.where(rh_challenge_rois[r1] == r2[0])[0]
+                        lh_roi_correlation.append(lh_correlation[lh_roi_idx])
+                        rh_roi_correlation.append(rh_correlation[rh_roi_idx])
+            roi_names.append('All vertices')
+            lh_roi_correlation.append(lh_correlation)
+            rh_roi_correlation.append(rh_correlation)
 
-        # Select the correlation results vertices of each ROI
-        roi_names = []
-        lh_roi_correlation = []
-        rh_roi_correlation = []
-        for r1 in range(len(lh_challenge_rois)):
-            for r2 in roi_name_maps[r1].items():
-                if r2[0] != 0: # zeros indicate to vertices falling outside the ROI of interest
-                    roi_names.append(r2[1])
-                    lh_roi_idx = np.where(lh_challenge_rois[r1] == r2[0])[0]
-                    rh_roi_idx = np.where(rh_challenge_rois[r1] == r2[0])[0]
-                    lh_roi_correlation.append(lh_correlation[lh_roi_idx])
-                    rh_roi_correlation.append(rh_correlation[rh_roi_idx])
-        roi_names.append('All vertices')
-        lh_roi_correlation.append(lh_correlation)
-        rh_roi_correlation.append(rh_correlation)
+            lh_mean_roi_correlation = [np.mean(np.nan_to_num(np.array(lh_roi_correlation[r]), copy=True, nan=0.0))
+                                        for r in range(len(lh_roi_correlation))]
+            rh_mean_roi_correlation = [np.mean(np.nan_to_num(np.array(rh_roi_correlation[r]), copy=True, nan=0.0))
+                                        for r in range(len(rh_roi_correlation))]
 
+            val_perf = (lh_mean_roi_correlation[-1] + rh_mean_roi_correlation[-1]) / 2
 
-        # Create the plot
-        lh_mean_roi_correlation = [np.mean(np.nan_to_num(np.array(lh_roi_correlation[r]), copy=True, nan=0.0, posinf=None, neginf=None))
-            for r in range(len(lh_roi_correlation))]
-        rh_mean_roi_correlation = [np.mean(np.nan_to_num(np.array(rh_roi_correlation[r]), copy=True, nan=0.0, posinf=None, neginf=None))
-            for r in range(len(rh_roi_correlation))]
+            print(f'[stage {stage}] epoch {epoch}: train_loss={train_loss:.6g} '
+                  f'val_loss={val_loss:.6g} val_perf={val_perf:.6g}')
 
-        val_perf = (lh_mean_roi_correlation[-1] + rh_mean_roi_correlation[-1]) / 2
+            is_best = bool(val_perf > args.val_perf)
 
-        print('val_perf:', val_perf) 
-        print('shape of rh_fmri_val_pred', rh_fmri_val_pred.shape)
-        if (args.gpu == 0) and (args.wandb_p): 
-            wandb_log = {"val_perf": val_perf}
-            roi_clusters = {'visuals':np.arange(0,7), 'bodies': np.arange(7,11), 'faces':np.arange(11,16), 'places':np.arange(16,19),'words':np.arange(19,24)}
-            for r in roi_clusters.keys():
-                wandb_log[f'{r}'] = np.nanmean(np.array(lh_mean_roi_correlation)[roi_clusters[r]])
-            wandb.log(wandb_log)
+            if (args.gpu == 0) and args.wandb_p:
+                wandb_log = {
+                    'epoch': epoch,
+                    'stage': stage,
+                    'train_loss': train_loss,
+                    'val_loss': val_loss,
+                    'val_perf': val_perf,
+                }
+                roi_clusters = {'visuals': np.arange(0, 7), 'bodies': np.arange(7, 11),
+                                'faces': np.arange(11, 16), 'places': np.arange(16, 19),
+                                'words': np.arange(19, 24)}
+                for r in roi_clusters.keys():
+                    wandb_log[r] = np.nanmean(np.array(lh_mean_roi_correlation)[roi_clusters[r]])
+                wandb.log(wandb_log)
 
-        if args.output_path:
-            # update best validation acc and save best model to output dir
-            if (val_perf > args.val_perf):  
-                args.val_perf = val_perf                
+            if args.output_path and args.gpu == 0:
+                with open(os.path.join(args.save_dir, 'val_results.txt'), 'a') as f:
+                    f.write(format_epoch_log_row(epoch, stage, train_loss, val_loss, val_perf, is_best) + '\n')
 
-                if args.gpu == 0: 
-                    with open(os.path.join(args.save_dir, 'val_results.txt'), 'a') as f:
-                            f.write(f'epoch {epoch}, val_perf: {val_perf} \n') 
+            if args.output_path and is_best:
+                args.val_perf = val_perf
 
                 if args.save_model:
-                    checkpoint_paths = [args.save_dir + '/checkpoint.pth']
+                    model_state_dict = {k: v for k, v in model.state_dict().items()
+                                         if 'backbone_model' not in k}
+                    utils.save_on_master({
+                        'model': model_state_dict,
+                        'lr_scheduler': lr_scheduler.state_dict(),
+                        'epoch': epoch,
+                        'stage': stage,
+                        'args': args,
+                        'val_perf': args.val_perf,
+                    }, args.save_dir + '/checkpoint.pth')
 
-                    model_state_dict = model.state_dict()
-                    model_state_dict = {
-                                k: v
-                                for k, v in model_state_dict.items()
-                                if "backbone_model" not in k
-                            }
-                    # print('checkpoint_path:',  checkpoint_paths)
-                    for checkpoint_path in checkpoint_paths:
-                        utils.save_on_master({
-                            'model': model_state_dict,
-                            # 'optimizer': optimizer.state_dict(),
-    #                         'train_params' : train_params,
-                            'lr_scheduler': lr_scheduler.state_dict(),
-                            'epoch': epoch,
-                            'args': args,
-                            'val_perf': args.val_perf
-                        }, checkpoint_path)
+                np.save(args.save_dir + 'lh_fmri_val_pred.npy', lh_fmri_val_pred)
+                np.save(args.save_dir + 'rh_fmri_val_pred.npy', rh_fmri_val_pred)
+                np.save(args.save_dir + 'lh_val_corr.npy', lh_correlation)
+                np.save(args.save_dir + 'rh_val_corr.npy', rh_correlation)
 
-                np.save(args.save_dir+'lh_fmri_val_pred.npy', lh_fmri_val_pred)
-                np.save(args.save_dir+'rh_fmri_val_pred.npy', rh_fmri_val_pred)
+                lh_fmri_test_pred, rh_fmri_test_pred = test(
+                    model, criterion, test_loader, args, lh_challenge_rois_s, rh_challenge_rois_s)
+                np.save(args.save_dir + '/lh_pred_test.npy', lh_fmri_test_pred.astype(np.float32))
+                np.save(args.save_dir + '/rh_pred_test.npy', rh_fmri_test_pred.astype(np.float32))
 
-                np.save(args.save_dir+'lh_val_corr.npy', lh_correlation)
-                np.save(args.save_dir+'rh_val_corr.npy', rh_correlation)
+    def _build_optim_for_stage(model, lr, n_epochs):
+        params = [p for p in model.parameters() if p.requires_grad]
+        opt = torch.optim.AdamW([{'params': params}], lr=lr, weight_decay=args.weight_decay)
+        total_iters = (args.vpt_stage_lr_total_iters
+                       if args.vpt_stage_lr_total_iters is not None else max(n_epochs, 1))
+        sched = torch.optim.lr_scheduler.LinearLR(
+            opt, start_factor=1.0, end_factor=args.vpt_stage_lr_end_factor,
+            total_iters=total_iters,
+        )
+        return opt, sched
 
-                lh_fmri_test_pred, rh_fmri_test_pred = test(model, criterion, test_loader, args, lh_challenge_rois_s, rh_challenge_rois_s)
+    if args.encoder_arch == 'vpt' and args.vpt_staged and not args.resume:
+        s1_epochs = args.vpt_stage1_epochs
+        s2_epochs = args.vpt_stage2_epochs
+        s3_epochs = args.vpt_stage3_epochs
+        if getattr(args, 'stage1_loaded_from', None):
+            print(f'[stage1] skipping in-run training (was {s1_epochs} epochs); '
+                  f'readout loaded from {args.stage1_loaded_from}')
+            s1_epochs = 0
 
-                lh_fmri_test_pred = lh_fmri_test_pred.astype(np.float32)
-                rh_fmri_test_pred = rh_fmri_test_pred.astype(np.float32)
-
-                np.save(args.save_dir+'/lh_pred_test.npy', lh_fmri_test_pred)
-                np.save(args.save_dir+'/rh_pred_test.npy', rh_fmri_test_pred)
+        epoch_cursor = 0
+        for stage_idx, n_epochs, lr_for_stage in (
+            (1, s1_epochs, args.vpt_stage1_lr if args.vpt_stage1_lr is not None else args.lr),
+            (2, s2_epochs, args.vpt_stage2_lr if args.vpt_stage2_lr is not None else args.lr),
+            (3, s3_epochs, args.vpt_stage3_lr if args.vpt_stage3_lr is not None else args.lr),
+        ):
+            if n_epochs <= 0:
+                continue
+            counts = set_stage(model, stage_idx)
+            print(f'\n[stage {stage_idx}] starting: epochs={n_epochs} lr={lr_for_stage} '
+                  f'readout_params={counts["readout_params"]} prompt_params={counts["prompt_params"]}')
+            opt, sched = _build_optim_for_stage(model, lr_for_stage, n_epochs)
+            run_epochs(model_ddp, model, criterion, opt, sched,
+                       train_loader, val_loader, test_loader, args,
+                       epoch_cursor, epoch_cursor + n_epochs, stage_idx,
+                       lh_challenge_rois, rh_challenge_rois, lh_challenge_rois_s, rh_challenge_rois_s,
+                       roi_name_maps)
+            epoch_cursor += n_epochs
+    else:
+        # Single-stage (legacy) path. Stage label = 0.
+        run_epochs(model_ddp, model, criterion, optimizer, lr_scheduler,
+                   train_loader, val_loader, test_loader, args,
+                   args.start_epoch, args.epochs, 0,
+                   lh_challenge_rois, rh_challenge_rois, lh_challenge_rois_s, rh_challenge_rois_s,
+                   roi_name_maps)
 
     if args.distributed:
         destroy_process_group()

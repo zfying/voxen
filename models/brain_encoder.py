@@ -8,7 +8,7 @@ from utils.utils import (NestedTensor, nested_tensor_from_tensor_list)
 from models.backbone import build_backbone
 from models.transformer import build_transformer
 from models.custom_transformer import build_custom_transformer
-from models.vpt import PromptBank, PerROILinearHead
+from models.vpt import PromptBank, PerROILinearHead, PerVoxelLinearHead
 
 class brain_encoder(nn.Module):
     def __init__(self, args):
@@ -95,6 +95,13 @@ class brain_encoder(nn.Module):
             D = self.backbone_model.num_channels
             if self.vpt_prompt_share == 'per_roi':
                 self.prompt_bank = PromptBank(self.num_queries, self.vpt_num_prompts_per_roi, D)
+            elif self.vpt_prompt_share == 'per_voxel':
+                # One K-prompt bundle per voxel. self.num_queries == lh_vs + rh_vs
+                # for readout_res='voxels'. Backbone runs once per voxel per image
+                # (folded into the batch dim, chunked by --vpt_roi_chunk).
+                assert args.vpt_readout == 'linear', \
+                    '--vpt_prompt_share per_voxel currently requires --vpt_readout linear'
+                self.prompt_bank = PromptBank(self.num_queries, self.vpt_num_prompts_per_roi, D)
             else:
                 # K shared prompts, one backbone forward per image.
                 assert args.vpt_readout == 'decoder', \
@@ -127,7 +134,20 @@ class brain_encoder(nn.Module):
                 else:
                     feat_dim = D
 
-                if self.vpt_linear_share == 'shared':
+                if self.vpt_prompt_share == 'per_voxel':
+                    # Per-voxel linear readout: every output unit is a single voxel.
+                    # Skip the universal lh_embed/rh_embed (which would map D->vs),
+                    # since each voxel only owns a scalar output.
+                    self.linear_feature_dim = feat_dim
+                    self._vpt_skip_universal_heads = True
+                    if self.vpt_linear_share == 'shared':
+                        # Single Linear(feat_dim, 1) shared across all voxels;
+                        # voxel identity is carried entirely by the prompt.
+                        self.shared_voxel_head = nn.Linear(feat_dim, 1)
+                    else:
+                        # 'per_voxel': one D->1 linear per voxel.
+                        self.per_voxel_head = PerVoxelLinearHead(feat_dim, self.num_queries)
+                elif self.vpt_linear_share == 'shared':
                     self.linear_feature_dim = feat_dim
                     self._vpt_skip_universal_heads = False
                 else:
@@ -380,6 +400,17 @@ class brain_encoder(nn.Module):
                 feat = torch.cat([prompt_BR.mean(dim=2), cls_BR], dim=-1)
             else:
                 raise ValueError(self.vpt_linear_feature)
+
+            if self.vpt_prompt_share == 'per_voxel':
+                # feat: [B, N_voxel, feat_dim] with N_voxel == lh_vs + rh_vs.
+                if self.vpt_linear_share == 'shared':
+                    pred = self.shared_voxel_head(feat).squeeze(-1)   # [B, N_voxel]
+                else:
+                    pred = self.per_voxel_head(feat)                  # [B, N_voxel]
+                lh_f_pred = pred[:, :self.lh_vs]                       # [B, lh_vs]
+                rh_f_pred = pred[:, self.lh_vs:]                       # [B, rh_vs]
+                return {'lh_f_pred': lh_f_pred, 'rh_f_pred': rh_f_pred,
+                        'output_tokens': feat}
 
             if self.vpt_linear_share == 'shared':
                 lh_f_pred = self.lh_embed(feat)        # [B, N_ROI, lh_vs]

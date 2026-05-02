@@ -65,3 +65,24 @@ class PerROILinearHead(nn.Module):
                 continue
             out[:, i].index_copy_(1, idx, head(feats[:, i]))
         return out
+
+
+class PerVoxelLinearHead(nn.Module):
+    """One D->1 linear per voxel, computed in a single fused op.
+
+    Used by VPT per-voxel mode: each voxel has its own readout weight + bias,
+    consuming a per-voxel feature vector (typically the mean-pooled K prompt
+    tokens after a per-voxel backbone forward).
+    """
+
+    def __init__(self, feat_dim: int, n_voxels: int):
+        super().__init__()
+        self.feat_dim = feat_dim
+        self.n_voxels = n_voxels
+        self.weight = nn.Parameter(torch.empty(n_voxels, feat_dim))
+        self.bias = nn.Parameter(torch.zeros(n_voxels))
+        nn.init.trunc_normal_(self.weight, std=0.02)
+
+    def forward(self, feats: torch.Tensor) -> torch.Tensor:
+        # feats: [B, n_voxels, feat_dim] -> [B, n_voxels]
+        return (feats * self.weight).sum(dim=-1) + self.bias

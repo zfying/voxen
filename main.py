@@ -82,16 +82,21 @@ def get_args_parser():
                         choices=['prompt', 'cls', 'pooled_patches', 'prompt_cls_concat'],
                         default='prompt', type=str,
                         help='Which per-ROI backbone output to feed the linear readout')
-    parser.add_argument('--vpt_linear_share', choices=['shared', 'per_roi'], default='shared', type=str,
-                        help='Whether the linear readout is shared across ROIs or per-ROI')
+    parser.add_argument('--vpt_linear_share', choices=['shared', 'per_roi', 'per_voxel'], default='shared', type=str,
+                        help='Linear readout sharing: shared across all output units, per-ROI head '
+                             '(requires --vpt_prompt_share per_roi), or per-voxel head '
+                             '(requires --vpt_prompt_share per_voxel).')
     parser.add_argument('--vpt_num_prompts_per_roi', default=1, type=int,
                         help='K: number of soft prompt tokens per ROI (default 1, VPT-Shallow)')
     parser.add_argument('--vpt_roi_chunk', default=0, type=int,
                         help='Process ROIs in chunks of this size to limit memory; 0 = single shot')
-    parser.add_argument('--vpt_prompt_share', choices=['per_roi', 'shared'], default='per_roi', type=str,
-                        help='per_roi: one prompt per ROI, ROI-folded backbone batch (~N_ROI x compute). '
+    parser.add_argument('--vpt_prompt_share', choices=['per_roi', 'shared', 'per_voxel'], default='per_roi', type=str,
+                        help='per_roi: one prompt bundle per ROI, ROI-folded backbone batch (~N_ROI x compute). '
                              'shared: K prompts shared across all ROIs, single backbone forward; '
-                             'shared mode requires --vpt_readout decoder.')
+                             'shared mode requires --vpt_readout decoder. '
+                             'per_voxel: one prompt bundle per voxel, voxel-folded backbone batch '
+                             '(~N_voxel x compute, ~thousands of forwards/image); requires '
+                             '--readout_res voxels and --vpt_readout linear.')
     parser.add_argument('--vpt_decoder_attend_prompts', action='store_true',
                         help='Shared-VPT only: concatenate prompt tokens into the decoder memory '
                              '(decoder cross-attends over patches+prompts). Default: patches only.')
@@ -293,7 +298,19 @@ def main(rank, world_size, args):
 
     if args.encoder_arch == 'vpt':
         assert args.saved_feats is None, '--saved_feats is incompatible with --encoder_arch vpt (prompts must propagate through the backbone)'
-        assert args.readout_res == 'rois_all', 'VPT currently requires --readout_res rois_all (one prompt per ROI)'
+        if args.vpt_prompt_share == 'per_voxel':
+            assert args.readout_res == 'voxels', \
+                '--vpt_prompt_share per_voxel requires --readout_res voxels'
+            assert args.vpt_readout == 'linear', \
+                'per_voxel VPT only supports --vpt_readout linear (decoder readout would need N_voxel queries)'
+            assert args.vpt_linear_share in ('shared', 'per_voxel'), \
+                'per_voxel VPT requires --vpt_linear_share shared or per_voxel'
+            assert args.vpt_roi_chunk > 0, \
+                'per_voxel VPT requires --vpt_roi_chunk > 0 (running all voxels at once will OOM)'
+        else:
+            assert args.readout_res == 'rois_all', 'VPT (per_roi/shared) requires --readout_res rois_all'
+            assert args.vpt_linear_share != 'per_voxel', \
+                '--vpt_linear_share per_voxel only applies to --vpt_prompt_share per_voxel'
 
     if args.dataset == 'nsd_algo':
 
@@ -368,7 +385,7 @@ def main(rank, world_size, args):
     
     
     if args.resume:
-        checkpoint = torch.load(args.resume, map_location='cpu')
+        checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
         pretrained_dict = checkpoint['model']
         model.load_state_dict(pretrained_dict)
         
@@ -394,7 +411,7 @@ def main(rank, world_size, args):
         if args.encoder_arch == 'vpt' and args.vpt_staged:
             ckpt_path = resolve_baseline_checkpoint(args)
             if ckpt_path is not None and os.path.exists(ckpt_path):
-                ckpt = torch.load(ckpt_path, map_location='cpu')
+                ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
                 src = ckpt['model'] if isinstance(ckpt, dict) and 'model' in ckpt else ckpt
                 report = partial_load_state_dict(model, src)
                 stage1_loaded_from = ckpt_path
