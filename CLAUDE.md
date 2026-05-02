@@ -40,28 +40,50 @@ VPT-specific flags:
 
 Smoke run: `python main.py --epochs 1 --subj 1 --encoder_arch vpt --vpt_readout linear --vpt_linear_feature prompt --vpt_linear_share shared --readout_res rois_all --backbone_arch dinov2 --batch_size 2 --vpt_roi_chunk 10`.
 
-Results are written to `{output_path}/nsd_test/{arch_tag}/subj_{subj}/{readout_res}/enc_{enc_output_layer}/run_{run}/`. For non-VPT encoders `arch_tag = {backbone_arch}_{encoder_arch}`; for VPT it is `{backbone_arch}_vpt-{vpt_prompt_share}-{vpt_readout}-{vpt_linear_feature}-{vpt_linear_share}-K{K}` plus a trailing `-attP` when `--vpt_decoder_attend_prompts` is set. Each run dir contains `params.txt`, `val_results.txt`, per-vertex correlation arrays, and per-epoch best test predictions. `visualize_results.ipynb` reads these; `visualize_vpt_experiments.ipynb` is the VPT-experiment-specific copy used for the sweeps below.
+### 3-stage VPT (`--vpt_staged`)
+
+Curriculum that splits VPT training into (1) readout only, (2) prompts only, (3) joint. A fresh `AdamW` and a fresh `LinearLR` scheduler are built at each stage transition (LR resets to that stage's full value and decays linearly across the stage). Backbone stays frozen throughout.
+
+Staged-only flags:
+- `--vpt_staged` — turns on the 3-stage loop. Overrides `--epochs` with the sum of stage budgets.
+- `--vpt_stage{1,2,3}_epochs N` (default 5 each).
+- `--vpt_stage{1,2,3}_lr LR` (default = `--lr`) — per-stage LR; lets stage 2 (prompts) use a higher LR than the more delicate joint stage, etc.
+- `--vpt_stage_lr_total_iters N` (default = that stage's epoch count) — `LinearLR.total_iters`.
+- `--vpt_stage_lr_end_factor F` (default 0.0) — LR at the end of each stage = `stage_lr * F`. 0.0 = decay to zero.
+- `--vpt_load_readout {auto, none, PATH}` (default `auto`) — controls stage 1:
+  - `auto`: look for a shape-compatible non-VPT baseline checkpoint at `{output_path}/nsd_test/{backbone}_transformer/subj_{subj}/{readout_res}/enc_{enc}/run_{run}/checkpoint.pth`. If found, partial-load matching keys (`lh_embed.*`, `rh_embed.*`, `transformer.*`, `query_embed.*`) and **skip stage 1 entirely**. Resolution lives in `staged.resolve_baseline_checkpoint`.
+  - `none`: always train stage 1 in-run for `--vpt_stage1_epochs` epochs.
+  - explicit path: same as `auto` but force-load from this file.
+- Compatibility: `auto`-load only works for VPT readouts whose readout shape matches the transformer baseline (`--vpt_readout decoder` with backbone hidden dim 768). VPT-linear has no compatible baseline, so stage 1 always runs in-run there.
+
+Staged runs append `-staged` to `arch_tag` so they don't collide with non-staged runs. The whole staged path is built around helpers in `staged.py` (`vpt_param_groups`, `set_stage`, `partial_load_state_dict`, `resolve_baseline_checkpoint`, `build_arch_tag`, `format_epoch_log_row`); these are pure (no I/O, no CUDA) and unit-tested in `tests/`.
+
+Results are written to `{output_path}/nsd_test/{arch_tag}/subj_{subj}/{readout_res}/enc_{enc_output_layer}/run_{run}/`. For non-VPT encoders `arch_tag = {backbone_arch}_{encoder_arch}`; for VPT it is `{backbone_arch}_vpt-{vpt_prompt_share}-{vpt_readout}-{vpt_linear_feature}-{vpt_linear_share}-K{K}` plus a trailing `-attP` when `--vpt_decoder_attend_prompts` is set, and a trailing `-staged` when `--vpt_staged` is set. Each run dir contains `params.txt`, `val_results.txt`, per-vertex correlation arrays, and per-epoch best test predictions. `visualize_results.ipynb` reads these; `visualize_vpt_experiments.ipynb` is the VPT-experiment-specific copy used for the sweeps below.
+
+`val_results.txt` is now a TSV: a header row (`epoch\tstage\ttrain_loss\tval_loss\tval_perf\tbest`) followed by **one row per epoch** (not just on improvement); the `best` column is `*` when the row was a new best-val. wandb (when `--wandb_p` is set) logs `{epoch, stage, train_loss, val_loss, val_perf}` plus per-cluster ROI means every epoch. Stage = 0 for non-staged runs, 1/2/3 for staged.
 
 ### VPT experiment scripts (`scripts/vpt/` + `scripts/run_vpt_experiments.sh`)
 
 Subj 1 sweep used to compare VPT variants. Each experiment is its own script under `scripts/vpt/`, sharing config via `scripts/vpt/_common.sh` (sourced):
 
-- `exp1_linear.sh` — baseline linear (`dinov2_q_linear`)
-- `exp2_transformer.sh` — baseline transformer (`dinov2_q_transformer`)
+- `exp1_linear.sh` — baseline linear (`dinov2_q_linear`); passes `--save_model 1`.
+- `exp2_transformer.sh` — baseline transformer (`dinov2_q_transformer`); passes `--save_model 1` so exp6 can auto-load its readout.
 - `exp3_shared_vpt.sh` — shared VPT + decoder, patches-only memory, K ∈ {1, 5, 10, 20, 40}
 - `exp4_per_roi_vpt.sh` — per-ROI VPT + linear, K=1 (~50× backbone compute)
 - `exp5_shared_vpt_attend_prompts.sh` — shared VPT + decoder with `--vpt_decoder_attend_prompts`, K ∈ {1, 5, 10, 20, 40}
+- `exp6_staged_vpt.sh` — 3-stage shared VPT + decoder; `--vpt_load_readout auto` will skip stage 1 by partial-loading from exp2's checkpoint when present. Per-stage budget via `S1`/`S2`/`S3` env vars (default 5 each); per-stage LR via `LR1`/`LR2`/`LR3` (default `$LR`); same `KS` sweep as exp3.
 
-Each script takes one optional positional arg (`GPU_ID`, default 0; exp4 default 1) and reads env-var overrides from `_common.sh` (`SUBJ`, `RUN`, `EPOCHS`, `BATCH_FAST`, `BATCH_VPT`, `ROI_CHUNK`, `LR`, `WANDB_PROJECT`). exp3/exp5 also accept `KS="20 40"` to override the K sweep.
+Each script takes one optional positional arg (`GPU_ID`, default 0; exp4 default 1) and reads env-var overrides from `_common.sh` (`SUBJ`, `RUN`, `EPOCHS`, `BATCH_FAST`, `BATCH_VPT`, `ROI_CHUNK`, `LR`, `WANDB_PROJECT`). exp3/exp5/exp6 also accept `KS="20 40"` to override the K sweep.
 
-`scripts/run_vpt_experiments.sh` is a thin orchestrator that delegates to those files. `[all]` (default) runs exp4 in the background on GPU 1 and exp1/2/3/5 serially on GPU 0; `[expN]` runs a single one. All experiments use `enc_output_layer=1`, `readout_res=rois_all`, `backbone=dinov2_q`, `lr=5e-4`, `epochs=15`.
+`scripts/run_vpt_experiments.sh` is a thin orchestrator that delegates to those files. `[all]` (default) runs exp4 in the background on GPU 1 and exp1/2/3/5/6 serially on GPU 0 (exp6 last, so exp2's checkpoint is on disk by the time exp6's auto-load runs); `[expN]` runs a single one. All experiments use `enc_output_layer=1`, `readout_res=rois_all`, `backbone=dinov2_q`, `lr=5e-4`, `epochs=15` (or per-stage budget for exp6).
 
-There is no test suite, lint config, or build step.
+`tests/` holds pytest unit tests for `staged.py` helpers (param partitioning, stage freezing, partial state-dict load, baseline-checkpoint resolution, arch_tag construction, log-row format). Run with `pytest tests/ -q` from the repo root. No CUDA or NSD data needed.
 
 ## Architecture
 
 **Entry points**
-- `main.py` — argparse + training loop. Builds dataloaders, model, criterion; runs `train_one_epoch` / `evaluate` / `test` per epoch; writes predictions and correlations whenever validation improves. Distributed code paths exist but are disabled (see TODO at bottom of `main.py`); always invoked as `main(0, 1, args)`.
+- `main.py` — argparse + training loop. Builds dataloaders, model, criterion; the per-epoch body lives in a closure `run_epochs(...)` that's either called once (legacy) or three times in sequence with fresh per-stage optimizers when `--vpt_staged` is set. Per-vertex correlations and best-val predictions are written inside `run_epochs`; per-epoch metric rows are appended to `val_results.txt` regardless of best-val. Distributed code paths exist but are disabled (see TODO at bottom of `main.py`); always invoked as `main(0, 1, args)`.
+- `staged.py` — pure helpers used by the staged path: `vpt_param_groups`, `set_stage`, `partial_load_state_dict`, `resolve_baseline_checkpoint`, `build_arch_tag`, `format_epoch_log_row`. No imports of the model or dataset code, so importing `staged` is cheap.
 - `engine.py` — `train_one_epoch`, `evaluate`, `test`, `evaluate_batch`. The `targets` plumbing is unusual: dataloaders return targets as a dict-of-tensors, which is rezipped into a list of per-sample dicts in the engine, then `SetCriterion` indexes `targets[0]` (TODO noted in code).
 - `brain_encoder_wrapper.py` — inference-time wrapper that loads one or many trained checkpoints (across runs / encoder layers, sharded across GPUs) and exposes predictions or attention activations. Used by the notebooks.
 

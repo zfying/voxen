@@ -109,10 +109,12 @@ def get_args_parser():
                         help='LR for stage 2 (prompts only). Defaults to --lr.')
     parser.add_argument('--vpt_stage3_lr', default=None, type=float,
                         help='LR for stage 3 (joint). Defaults to --lr.')
-    parser.add_argument('--vpt_stage_lr_drop', default=None, type=int,
-                        help='StepLR step_size within each stage. Defaults to --lr_drop.')
-    parser.add_argument('--vpt_stage_lr_gamma', default=0.5, type=float,
-                        help='StepLR gamma applied within each stage.')
+    parser.add_argument('--vpt_stage_lr_total_iters', default=None, type=int,
+                        help='LinearLR total_iters within each stage. Defaults to that '
+                             'stage\'s epoch count (so LR decays linearly across the whole stage).')
+    parser.add_argument('--vpt_stage_lr_end_factor', default=0.0, type=float,
+                        help='LinearLR end_factor (final LR = stage_lr * end_factor). Default 0.0 '
+                             '= decay to zero by the last epoch of the stage.')
     parser.add_argument('--vpt_load_readout', default='auto', type=str,
                         help="'auto' (default): load readout from a shape-compatible baseline "
                              "checkpoint under output_path if one exists, then skip stage 1. "
@@ -548,11 +550,15 @@ def main(rank, world_size, args):
                 np.save(args.save_dir + '/lh_pred_test.npy', lh_fmri_test_pred.astype(np.float32))
                 np.save(args.save_dir + '/rh_pred_test.npy', rh_fmri_test_pred.astype(np.float32))
 
-    def _build_optim_for_stage(model, lr):
+    def _build_optim_for_stage(model, lr, n_epochs):
         params = [p for p in model.parameters() if p.requires_grad]
         opt = torch.optim.AdamW([{'params': params}], lr=lr, weight_decay=args.weight_decay)
-        step = args.vpt_stage_lr_drop if args.vpt_stage_lr_drop is not None else args.lr_drop
-        sched = torch.optim.lr_scheduler.StepLR(opt, step_size=step, gamma=args.vpt_stage_lr_gamma)
+        total_iters = (args.vpt_stage_lr_total_iters
+                       if args.vpt_stage_lr_total_iters is not None else max(n_epochs, 1))
+        sched = torch.optim.lr_scheduler.LinearLR(
+            opt, start_factor=1.0, end_factor=args.vpt_stage_lr_end_factor,
+            total_iters=total_iters,
+        )
         return opt, sched
 
     if args.encoder_arch == 'vpt' and args.vpt_staged and not args.resume:
@@ -575,7 +581,7 @@ def main(rank, world_size, args):
             counts = set_stage(model, stage_idx)
             print(f'\n[stage {stage_idx}] starting: epochs={n_epochs} lr={lr_for_stage} '
                   f'readout_params={counts["readout_params"]} prompt_params={counts["prompt_params"]}')
-            opt, sched = _build_optim_for_stage(model, lr_for_stage)
+            opt, sched = _build_optim_for_stage(model, lr_for_stage, n_epochs)
             run_epochs(model_ddp, model, criterion, opt, sched,
                        train_loader, val_loader, test_loader, args,
                        epoch_cursor, epoch_cursor + n_epochs, stage_idx,
