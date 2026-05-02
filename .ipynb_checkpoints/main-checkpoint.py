@@ -49,11 +49,11 @@ def get_args_parser():
     ## NSD params
     parser.add_argument('--subj', default=1, type=int) 
     parser.add_argument('--run', default=1, type=int)  
-    parser.add_argument('--data_dir', default='../../../algonauts/algonauts_2023_challenge_data/', type=str)
+    parser.add_argument('--data_dir', default='./algonauts_2023_challenge_data/', type=str)
     parser.add_argument('--parent_submission_dir', default='./algonauts_2023_challenge_submission/', type=str)
     
     parser.add_argument('--saved_feats', default=None, type=str) #'dinov2q'
-    parser.add_argument('--saved_feats_dir', default='../../algonauts_image_features/', type=str) 
+    parser.add_argument('--saved_feats_dir', default='./algonauts_image_features/', type=str) 
     
     parser.add_argument('--readout_res', choices=['voxels', 'rois_all', 'streams_inc', 'visuals', 'bodies', 'faces', 'places','words',
                                                   'hemis']
@@ -83,6 +83,9 @@ def get_args_parser():
                         help='per_roi: one prompt per ROI, ROI-folded backbone batch (~N_ROI x compute). '
                              'shared: K prompts shared across all ROIs, single backbone forward; '
                              'shared mode requires --vpt_readout decoder.')
+    parser.add_argument('--vpt_decoder_attend_prompts', action='store_true',
+                        help='Shared-VPT only: concatenate prompt tokens into the decoder memory '
+                             '(decoder cross-attends over patches+prompts). Default: patches only.')
     
     parser.add_argument('--objective', choices=['NSD'],
                         default='classification', help='which model to train')
@@ -254,6 +257,8 @@ def main(rank, world_size, args):
             arch_tag = (f'{args.backbone_arch}_vpt-{args.vpt_prompt_share}-{args.vpt_readout}'
                         f'-{args.vpt_linear_feature}-{args.vpt_linear_share}'
                         f'-K{args.vpt_num_prompts_per_roi}')
+            if args.vpt_decoder_attend_prompts:
+                arch_tag += '-attP'
         else:
             arch_tag = f'{args.backbone_arch}_{args.encoder_arch}'
         args.save_dir = args.output_path + f'nsd_test/{arch_tag}/subj_{args.subj}/{args.readout_res}/enc_{args.enc_output_layer}/run_{args.run}/'
