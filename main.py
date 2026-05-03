@@ -400,7 +400,11 @@ def main(rank, world_size, args):
                           weight_decay=args.weight_decay)
             optimizer.load_state_dict(checkpoint['optimizer'])
         
-            lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop, gamma=0.5)
+            lr_scheduler = torch.optim.lr_scheduler.LinearLR(
+                optimizer, start_factor=1.0,
+                end_factor=args.vpt_stage_lr_end_factor,
+                total_iters=max(args.epochs, 1),
+            )
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
             args.start_epoch = checkpoint['epoch'] + 1
             
@@ -434,7 +438,11 @@ def main(rank, world_size, args):
             print('\ntrain_params', train_params)
             optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
                                           weight_decay=args.weight_decay)
-            lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop, gamma=0.5)
+            lr_scheduler = torch.optim.lr_scheduler.LinearLR(
+                optimizer, start_factor=1.0,
+                end_factor=args.vpt_stage_lr_end_factor,
+                total_iters=max(args.epochs, 1),
+            )
 
         args.start_epoch = 0
 
